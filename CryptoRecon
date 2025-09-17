@@ -1,341 +1,180 @@
 #!/usr/bin/env python3
-"""
-crypto_recon.py
-Simple defensive OSINT recon for a username or wallet address across BTC, ETH, SOL, XMR.
-
-Usage:
-  python3 crypto_recon.py --target alice123 --type username
-  python3 crypto_recon.py --target 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa --type address --chains btc,eth
-
-Notes:
- - No paid APIs required. The script scrapes public web pages and known explorers.
- - Be polite: it respects robots.txt, per-domain spacing and rate limits.
- - Results are saved to findings_<target>.json and raw HTML snapshots in reports/<target>/
-"""
-
-import argparse, os, time, json, random, re, sys
-from urllib.parse import quote_plus, urlparse
-import requests
+import argparse, os, re, json, time, random, sqlite3, requests
 from bs4 import BeautifulSoup
-from urllib import robotparser
+from urllib.parse import quote
 
-# ------------- CONFIG -------------
-DDG_HTML = "https://html.duckduckgo.com/html?q={q}"
-USER_AGENTS = [
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-    "crypto-recon/1.0 (+https://github.com/yourname)"
-]
-HEADERS_BASE = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
-
-COMMON_SOCIAL_SITES = [
-    "github.com", "twitter.com", "reddit.com", "medium.com", "linkedin.com",
-    "pastebin.com", "gist.github.com", "bitcointalk.org", "paste.rs"
+# --- Signatures to detect ---
+LEAK_PATTERNS = [
+    re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}:[^\s]+"),  # email:password
+    re.compile(r"\b\w+:\w+\b"),  # user:pass
 ]
 
+# --- Blockchain explorers ---
 EXPLORERS = {
-    "btc": [
-        "https://blockchair.com/bitcoin/address/{addr}",
-        "https://www.blockchain.com/btc/address/{addr}",
-        "https://mempool.space/address/{addr}"
-    ],
-    "eth": [
-        "https://blockchair.com/ethereum/address/{addr}",
-        "https://etherscan.io/address/{addr}",
-        "https://ethplorer.io/address/{addr}"
-    ],
-    "sol": [
-        "https://solscan.io/account/{addr}",
-        "https://explorer.solana.com/address/{addr}"
-    ],
-    "xmr": [
-        "https://xmrchain.net/search?value={addr}",
-        "https://xmrchain.net/address/{addr}"
-    ]
+    "btc": ["https://blockchair.com/bitcoin/address/{}", "https://www.blockchain.com/btc/address/{}"],
+    "eth": ["https://etherscan.io/address/{}", "https://blockchair.com/ethereum/address/{}"],
+    "sol": ["https://solscan.io/account/{}"],
+    "xmr": ["https://xmrchain.net/search?value={}"],  # XMR support is limited
 }
 
-# heuristics for address detection
-BTC_RE = re.compile(r"^[13][A-HJ-NP-Za-km-z1-9]{25,34}$")
-ETH_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
-SOL_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")  # approximate
-XMR_RE = re.compile(r"^(4[0-9AB][1-9A-HJ-NP-Za-km-z]{93})$")  # old primary address pattern (approx)
+# --- Optional API integrations ---
+BLOCKCHAIR_API_KEY = os.getenv("BLOCKCHAIR_API_KEY")
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 
-# polite defaults
-MIN_DELAY = 1.0
-MAX_DELAY = 3.0
-PER_DOMAIN_INTERVAL = 5.0
+# --- User agents ---
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) Firefox/117.0",
+]
 
-# ----------------- HELPERS -----------------
-def choose_ua():
-    return random.choice(USER_AGENTS)
+# --- SQLite cache ---
+def init_db(path):
+    conn = sqlite3.connect(path)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS cache (
+                 url TEXT PRIMARY KEY,
+                 timestamp INTEGER,
+                 status TEXT
+                 )""")
+    conn.commit()
+    return conn
 
-def polite_sleep(min_d=MIN_DELAY, max_d=MAX_DELAY):
-    t = random.uniform(min_d, max_d)
-    time.sleep(t)
-
-def domain_of(url):
+def fetch_url(url, session, use_cache=True, conn=None):
+    if use_cache and conn:
+        cur = conn.cursor()
+        cur.execute("SELECT status FROM cache WHERE url = ?", (url,))
+        row = cur.fetchone()
+        if row:
+            return None  # skip cached
     try:
-        return urlparse(url).netloc.lower()
-    except:
-        return ""
-
-def obeys_robots(session, url, ua="*"):
-    parsed = urlparse(url)
-    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-    rp = robotparser.RobotFileParser()
-    try:
-        r = session.get(robots_url, headers={**HEADERS_BASE, "User-Agent": choose_ua()}, timeout=8)
-        if r.status_code == 200:
-            rp.parse(r.text.splitlines())
-            return rp.can_fetch(ua, url)
-        else:
-            return True
-    except Exception:
-        return True
-
-def ddg_search(query, session):
-    url = DDG_HTML.format(q=quote_plus(query))
-    headers = {**HEADERS_BASE, "User-Agent": choose_ua()}
-    r = session.post(url, headers=headers, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
-    links = []
-    for a in soup.select("a.result__a"):
-        href = a.get("href")
-        if href:
-            links.append(href)
-    if not links:
-        for a in soup.find_all("a", href=True):
-            href = a['href']
-            if href.startswith("http"):
-                links.append(href)
-    return links
-
-def fetch_page(url, session, max_text=500000):
-    headers = {**HEADERS_BASE, "User-Agent": choose_ua()}
-    try:
-        r = session.get(url, headers=headers, timeout=20, allow_redirects=True)
-        r.raise_for_status()
-        text = r.text
-        if len(text) > max_text:
-            text = text[:max_text]
-        return {"status":"ok", "text": text, "url": r.url, "code": r.status_code, "headers": dict(r.headers)}
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        r = session.get(url, headers=headers, timeout=20)
+        status = "ok" if r.ok else f"err_{r.status_code}"
+        if conn:
+            conn.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?)",
+                         (url, int(time.time()), status))
+            conn.commit()
+        return r.text
     except Exception as e:
-        return {"status":"error", "error": str(e)}
+        if conn:
+            conn.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?)",
+                         (url, int(time.time()), f"error:{e}"))
+            conn.commit()
+        return None
 
-def save_snapshot(target, name, url, html):
-    d = os.path.join("reports", target)
-    os.makedirs(d, exist_ok=True)
-    fname = os.path.join(d, f"{name}.html")
-    try:
-        with open(fname, "w", encoding="utf-8", errors="ignore") as fh:
-            fh.write(f"<!-- source: {url} -->\n")
-            fh.write(html)
-    except Exception as e:
-        print(f"[!] failed saving snapshot: {e}")
-
-def scan_text_for_target(text, target):
+def search_patterns(html):
     findings = []
-    low = text.lower()
-    if target.lower() in low:
-        idx = low.find(target.lower())
-        start = max(0, idx - 120)
-        end = min(len(text), idx + 120)
-        findings.append({"type":"exact_match", "snippet": text[start:end].replace("\n"," ")})
-    # additional heuristics: look for "tx", "balance", "transactions", "sent", "received"
-    ctx = re.findall(r"(.{0,80}" + re.escape(target) + r".{0,80})", text, flags=re.IGNORECASE)
-    for c in ctx:
-        findings.append({"type":"context", "snippet": c})
-    return findings
+    for pattern in LEAK_PATTERNS:
+        matches = pattern.findall(html)
+        if matches:
+            findings.extend(matches)
+    return list(set(findings))
 
-# ----------------- CHAIN-SPECIFIC -----------------
-def try_explorers_for_address(addr, chains, session, domain_last_time):
-    results = []
-    for ch in chains:
-        if ch not in EXPLORERS:
-            continue
-        for template in EXPLORERS[ch]:
-            url = template.format(addr=addr)
-            dom = domain_of(url)
-            # per-domain spacing
-            last = domain_last_time.get(dom)
-            if last:
-                since = time.time() - last
-                if since < PER_DOMAIN_INTERVAL:
-                    wait = PER_DOMAIN_INTERVAL - since + random.uniform(0.2,0.8)
-                    print(f"[i] waiting {wait:.1f}s before requesting {dom}")
-                    time.sleep(wait)
-            # robots
-            if not obeys_robots(session, url):
-                print(f"[-] skipping {url} due to robots.txt")
-                domain_last_time[dom] = time.time()
-                continue
-            print(f"[+] fetching explorer: {url}")
-            res = fetch_page(url, session)
-            domain_last_time[dom] = time.time()
-            polite_sleep()
-            if res["status"] == "ok":
-                findings = scan_text_for_target(res["text"], addr)
-                if findings:
-                    results.append({"explorer": url, "matches": findings})
-                # save snapshot
-                save_snapshot(addr, f"{ch}_explorer_{hash(url)%10000}", res.get("url", url), res["text"])
-            else:
-                results.append({"explorer": url, "error": res.get("error")})
-    return results
-
-# ----------------- USERNAME MODE -----------------
-def username_recon(username, chains, session, limit=50):
-    results = {"search_hits": [], "explorer_hits": []}
-    domain_last_time = {}
-    # search social sites first (site: dorks)
-    queries = []
-    for s in COMMON_SOCIAL_SITES:
-        queries.append(f'site:{s} "{username}"')
-    # generic
-    queries.append(f'"{username}"')
-    checked = 0
-    for q in queries:
-        if checked >= limit:
-            break
-        try:
-            links = ddg_search(q, session)
-        except Exception as e:
-            print(f"[!] ddg error for '{q}': {e}")
-            polite_sleep()
-            continue
-        for link in links:
-            if checked >= limit:
-                break
-            if not link.startswith("http"):
-                continue
-            dom = domain_of(link)
-            last = domain_last_time.get(dom)
-            if last:
-                since = time.time() - last
-                if since < PER_DOMAIN_INTERVAL:
-                    wait = PER_DOMAIN_INTERVAL - since + random.uniform(0.2,0.8)
-                    print(f"[i] waiting {wait:.1f}s before requesting {dom}")
-                    time.sleep(wait)
-            if not obeys_robots(session, link):
-                print(f"[-] skip {link} due to robots")
-                domain_last_time[dom] = time.time()
-                continue
-            print(f"[+] checking link: {link}")
-            res = fetch_page(link, session)
-            domain_last_time[dom] = time.time()
-            polite_sleep()
-            checked += 1
-            if res["status"] == "ok":
-                findings = scan_text_for_target(res["text"], username)
-                if findings:
-                    results["search_hits"].append({"url": link, "matches": findings})
-                save_snapshot(username, f"search_{checked}", res.get("url", link), res["text"])
-            else:
-                results["search_hits"].append({"url": link, "error": res.get("error")})
-    # optional: if username looks like an address for some chain, also try explorers
-    # we'll attempt explorer lookups across requested chains
-    # if chains provided, try search with common wallet patterns: username + "wallet" or username + "sol" etc.
-    return results
-
-# ----------------- ADDRESS MODE -----------------
-def address_recon(addr, chains, session):
-    results = {"web_search": [], "explorers": []}
-    domain_last_time = {}
-    # 1) Perform web-wide exact-address search
-    q = f'"{addr}"'
+# --- Optional API enrichment ---
+def enrich_blockchair(addr, chain):
+    if not BLOCKCHAIR_API_KEY:
+        return None
+    chain_map = {"btc":"bitcoin","eth":"ethereum","sol":"solana","xmr":"monero"}
+    api_chain = chain_map.get(chain)
+    if not api_chain:
+        return None
+    url = f"https://api.blockchair.com/{api_chain}/dashboards/address/{addr}?key={BLOCKCHAIR_API_KEY}"
     try:
-        links = ddg_search(q, session)
+        r = requests.get(url, timeout=15, headers={"User-Agent": random.choice(USER_AGENTS)})
+        if r.ok:
+            return r.json()
+        return {"error": f"status {r.status_code}"}
     except Exception as e:
-        print(f"[!] ddg search error: {e}")
-        links = []
-    checked = 0
-    for link in links:
-        if checked >= 40:
-            break
-        if not link.startswith("http"):
-            continue
-        dom = domain_of(link)
-        last = domain_last_time.get(dom)
-        if last:
-            since = time.time() - last
-            if since < PER_DOMAIN_INTERVAL:
-                wait = PER_DOMAIN_INTERVAL - since + random.uniform(0.2,0.8)
-                print(f"[i] waiting {wait:.1f}s before requesting {dom}")
-                time.sleep(wait)
-        if not obeys_robots(session, link):
-            print(f"[-] skip {link} due to robots")
-            domain_last_time[dom] = time.time()
-            continue
-        print(f"[+] checking {link}")
-        res = fetch_page(link, session)
-        domain_last_time[dom] = time.time()
-        polite_sleep()
-        checked += 1
-        if res["status"] == "ok":
-            findings = scan_text_for_target(res["text"], addr)
-            if findings:
-                results["web_search"].append({"url": link, "matches": findings})
-            save_snapshot(addr, f"websearch_{checked}", res.get("url", link), res["text"])
-        else:
-            results["web_search"].append({"url": link, "error": res.get("error")})
-    # 2) Try specific explorers for the requested chains
-    explorer_results = try_explorers_for_address(addr, chains, session, domain_last_time)
-    results["explorers"].extend(explorer_results)
+        return {"error": str(e)}
+
+def enrich_etherscan(addr):
+    if not ETHERSCAN_API_KEY:
+        return None
+    url = f"https://api.etherscan.io/api?module=account&action=balance&address={addr}&tag=latest&apikey={ETHERSCAN_API_KEY}"
+    try:
+        r = requests.get(url, timeout=12, headers={"User-Agent": random.choice(USER_AGENTS)})
+        if r.ok:
+            return r.json()
+        return {"error": f"status {r.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# --- Recon for addresses ---
+def recon_address(addr, chains, session, conn=None, use_cache=True):
+    results = []
+    for chain in chains:
+        # API enrichment
+        api_data = None
+        if chain == "eth" and ETHERSCAN_API_KEY:
+            api_data = enrich_etherscan(addr)
+            results.append({"explorer_api":"etherscan","chain":chain,"data":api_data})
+        if BLOCKCHAIR_API_KEY:
+            api_data = enrich_blockchair(addr, chain)
+            if api_data:
+                results.append({"explorer_api":"blockchair","chain":chain,"data":api_data})
+
+        # Web scraping
+        for url_template in EXPLORERS.get(chain, []):
+            url = url_template.format(addr)
+            html = fetch_url(url, session, use_cache=use_cache, conn=conn)
+            if html is None:
+                continue
+            leaks = search_patterns(html)
+            results.append({"url": url, "matches": leaks})
+            # save snapshot
+            os.makedirs(f"reports/{addr}", exist_ok=True)
+            with open(f"reports/{addr}/{chain}_{hash(url)}.html","w") as f:
+                f.write(html)
+            time.sleep(random.uniform(2,5))
     return results
 
-# ----------------- VALIDATION -----------------
-def detect_chain_by_addr(addr):
-    out = []
-    if BTC_RE.match(addr):
-        out.append("btc")
-    if ETH_RE.match(addr):
-        out.append("eth")
-    # Solana addresses vary; include sol as possible if not ETH
-    if SOL_RE.match(addr):
-        out.append("sol")
-    if XMR_RE.match(addr):
-        out.append("xmr")
-    return out
+# --- Recon for usernames via DuckDuckGo ---
+def recon_username(username, session, conn=None, use_cache=True, limit=10):
+    results = []
+    query = quote(username)
+    ddg_url = f"https://html.duckduckgo.com/html/?q={query}"
+    html = fetch_url(ddg_url, session, use_cache=use_cache, conn=conn)
+    if html:
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.find_all("a", href=True):
+            url = a["href"]
+            if "duckduckgo.com" in url:
+                continue
+            leaks = search_patterns(url)
+            results.append({"url": url, "matches": leaks})
+            if len(results) >= limit:
+                break
+    return results
 
-# ----------------- MAIN -----------------
+# --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Crypto recon (username or address) across BTC/ETH/SOL/XMR (no paid APIs).")
-    parser.add_argument("--target", "-t", required=True, help="username or wallet address to investigate")
-    parser.add_argument("--type", "-y", required=True, choices=["username","address"], help="mode: username or address")
-    parser.add_argument("--chains", "-c", default="", help="comma list of chains to target (btc,eth,sol,xmr) - optional for username, recommended for address")
-    parser.add_argument("--limit", type=int, default=50, help="max search results to check (approx)")
+    parser = argparse.ArgumentParser(
+        description="Crypto Recon OSINT Tool - Search usernames or wallet addresses",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("--target","-t",required=True, help="Username or wallet address to investigate")
+    parser.add_argument("--type","-y",required=True,choices=["username","address"], help="Target type")
+    parser.add_argument("--chains","-c",default="btc,eth,sol,xmr", help="Comma-separated chains (default: all)")
+    parser.add_argument("--db",default="cache.db", help="SQLite DB path for caching")
+    parser.add_argument("--no-cache",action="store_true", help="Bypass cache for debugging")
+    parser.add_argument("--limit",type=int,default=10, help="Max number of search results for username recon")
     args = parser.parse_args()
 
-    target = args.target.strip()
-    chains = [c.strip().lower() for c in args.chains.split(",") if c.strip()]
-    if args.type == "address":
-        # if no chain specified, attempt detection heuristics
-        if not chains:
-            guessed = detect_chain_by_addr(target)
-            chains = guessed if guessed else ["btc","eth","sol","xmr"]
-            print(f"[i] guessed chains: {chains}")
-    else:
-        if not chains:
-            chains = ["btc","eth","sol","xmr"]
-
+    chains = args.chains.split(",")
     session = requests.Session()
-    report = {"target": target, "type": args.type, "chains": chains, "timestamp": time.time(), "results": {}}
+    conn = None if args.no_cache else init_db(args.db)
 
-    if args.type == "username":
-        print(f"[+] running username recon for {target}")
-        report["results"] = username_recon(target, chains, session, limit=args.limit)
+    results = {"target": args.target, "type": args.type, "results":[]}
+
+    if args.type=="address":
+        results["results"] = recon_address(args.target, chains, session, conn=conn, use_cache=not args.no_cache)
     else:
-        print(f"[+] running address recon for {target} on chains: {chains}")
-        report["results"] = address_recon(target, chains, session)
+        results["results"] = recon_username(args.target, session, conn=conn, use_cache=not args.no_cache, limit=args.limit)
 
-    # Save report
-    safe_name = re.sub(r"[^A-Za-z0-9_\-\.]", "_", target)[:80]
-    out_file = f"findings_{safe_name}.json"
-    with open(out_file, "w") as fh:
-        json.dump(report, fh, indent=2)
-    print(f"[+] report saved to {out_file}")
-    print("[+] snapshots (if any) saved under reports/{target}/")
+    with open(f"findings_{args.target}.json","w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[*] Done. JSON saved to findings_{args.target}.json")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

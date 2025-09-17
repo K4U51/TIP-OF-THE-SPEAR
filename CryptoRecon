@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+crypto_recon.py
+Simple defensive OSINT recon for a username or wallet address across BTC, ETH, SOL, XMR.
+
+Usage:
+  python3 crypto_recon.py --target alice123 --type username
+  python3 crypto_recon.py --target 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa --type address --chains btc,eth
+
+Notes:
+ - No paid APIs required. The script scrapes public web pages and known explorers.
+ - Be polite: it respects robots.txt, per-domain spacing and rate limits.
+ - Results are saved to findings_<target>.json and raw HTML snapshots in reports/<target>/
+"""
+
+import argparse, os, time, json, random, re, sys
+from urllib.parse import quote_plus, urlparse
+import requests
+from bs4 import BeautifulSoup
+from urllib import robotparser
+
+# ------------- CONFIG -------------
+DDG_HTML = "https://html.duckduckgo.com/html?q={q}"
+USER_AGENTS = [
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "crypto-recon/1.0 (+https://github.com/yourname)"
+]
+HEADERS_BASE = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+
+COMMON_SOCIAL_SITES = [
+    "github.com", "twitter.com", "reddit.com", "medium.com", "linkedin.com",
+    "pastebin.com", "gist.github.com", "bitcointalk.org", "paste.rs"
+]
+
+EXPLORERS = {
+    "btc": [
+        "https://blockchair.com/bitcoin/address/{addr}",
+        "https://www.blockchain.com/btc/address/{addr}",
+        "https://mempool.space/address/{addr}"
+    ],
+    "eth": [
+        "https://blockchair.com/ethereum/address/{addr}",
+        "https://etherscan.io/address/{addr}",
+        "https://ethplorer.io/address/{addr}"
+    ],
+    "sol": [
+        "https://solscan.io/account/{addr}",
+        "https://explorer.solana.com/address/{addr}"
+    ],
+    "xmr": [
+        "https://xmrchain.net/search?value={addr}",
+        "https://xmrchain.net/address/{addr}"
+    ]
+}
+
+# heuristics for address detection
+BTC_RE = re.compile(r"^[13][A-HJ-NP-Za-km-z1-9]{25,34}$")
+ETH_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+SOL_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")  # approximate
+XMR_RE = re.compile(r"^(4[0-9AB][1-9A-HJ-NP-Za-km-z]{93})$")  # old primary address pattern (approx)
+
+# polite defaults
+MIN_DELAY = 1.0
+MAX_DELAY = 3.0
+PER_DOMAIN_INTERVAL = 5.0
+
+# ----------------- HELPERS -----------------
+def choose_ua():
+    return random.choice(USER_AGENTS)
+
+def polite_sleep(min_d=MIN_DELAY, max_d=MAX_DELAY):
+    t = random.uniform(min_d, max_d)
+    time.sleep(t)
+
+def domain_of(url):
+    try:
+        return urlparse(url).netloc.lower()
+    except:
+        return ""
+
+def obeys_robots(session, url, ua="*"):
+    parsed = urlparse(url)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    rp = robotparser.RobotFileParser()
+    try:
+        r = session.get(robots_url, headers={**HEADERS_BASE, "User-Agent": choose_ua()}, timeout=8)
+        if r.status_code == 200:
+            rp.parse(r.text.splitlines())
+            return rp.can_fetch(ua, url)
+        else:
+            return True
+    except Exception:
+        return True
+
+def ddg_search(query, session):
+    url = DDG_HTML.format(q=quote_plus(query))
+    headers = {**HEADERS_BASE, "User-Agent": choose_ua()}
+    r = session.post(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    links = []
+    for a in soup.select("a.result__a"):
+        href = a.get("href")
+        if href:
+            links.append(href)
+    if not links:
+        for a in soup.find_all("a", href=True):
+            href = a['href']
+            if href.startswith("http"):
+                links.append(href)
+    return links
+
+def fetch_page(url, session, max_text=500000):
+    headers = {**HEADERS_BASE, "User-Agent": choose_ua()}
+    try:
+        r = session.get(url, headers=headers, timeout=20, allow_redirects=True)
+        r.raise_for_status()
+        text = r.text
+        if len(text) > max_text:
+            text = text[:max_text]
+        return {"status":"ok", "text": text, "url": r.url, "code": r.status_code, "headers": dict(r.headers)}
+    except Exception as e:
+        return {"status":"error", "error": str(e)}
+
+def save_snapshot(target, name, url, html):
+    d = os.path.join("reports", target)
+    os.makedirs(d, exist_ok=True)
+    fname = os.path.join(d, f"{name}.html")
+    try:
+        with open(fname, "w", encoding="utf-8", errors="ignore") as fh:
+            fh.write(f"<!-- source: {url} -->\n")
+            fh.write(html)
+    except Exception as e:
+        print(f"[!] failed saving snapshot: {e}")
+
+def scan_text_for_target(text, target):
+    findings = []
+    low = text.lower()
+    if target.lower() in low:
+        idx = low.find(target.lower())
+        start = max(0, idx - 120)
+        end = min(len(text), idx + 120)
+        findings.append({"type":"exact_match", "snippet": text[start:end].replace("\n"," ")})
+    # additional heuristics: look for "tx", "balance", "transactions", "sent", "received"
+    ctx = re.findall(r"(.{0,80}" + re.escape(target) + r".{0,80})", text, flags=re.IGNORECASE)
+    for c in ctx:
+        findings.append({"type":"context", "snippet": c})
+    return findings
+
+# ----------------- CHAIN-SPECIFIC -----------------
+def try_explorers_for_address(addr, chains, session, domain_last_time):
+    results = []
+    for ch in chains:
+        if ch not in EXPLORERS:
+            continue
+        for template in EXPLORERS[ch]:
+            url = template.format(addr=addr)
+            dom = domain_of(url)
+            # per-domain spacing
+            last = domain_last_time.get(dom)
+            if last:
+                since = time.time() - last
+                if since < PER_DOMAIN_INTERVAL:
+                    wait = PER_DOMAIN_INTERVAL - since + random.uniform(0.2,0.8)
+                    print(f"[i] waiting {wait:.1f}s before requesting {dom}")
+                    time.sleep(wait)
+            # robots
+            if not obeys_robots(session, url):
+                print(f"[-] skipping {url} due to robots.txt")
+                domain_last_time[dom] = time.time()
+                continue
+            print(f"[+] fetching explorer: {url}")
+            res = fetch_page(url, session)
+            domain_last_time[dom] = time.time()
+            polite_sleep()
+            if res["status"] == "ok":
+                findings = scan_text_for_target(res["text"], addr)
+                if findings:
+                    results.append({"explorer": url, "matches": findings})
+                # save snapshot
+                save_snapshot(addr, f"{ch}_explorer_{hash(url)%10000}", res.get("url", url), res["text"])
+            else:
+                results.append({"explorer": url, "error": res.get("error")})
+    return results
+
+# ----------------- USERNAME MODE -----------------
+def username_recon(username, chains, session, limit=50):
+    results = {"search_hits": [], "explorer_hits": []}
+    domain_last_time = {}
+    # search social sites first (site: dorks)
+    queries = []
+    for s in COMMON_SOCIAL_SITES:
+        queries.append(f'site:{s} "{username}"')
+    # generic
+    queries.append(f'"{username}"')
+    checked = 0
+    for q in queries:
+        if checked >= limit:
+            break
+        try:
+            links = ddg_search(q, session)
+        except Exception as e:
+            print(f"[!] ddg error for '{q}': {e}")
+            polite_sleep()
+            continue
+        for link in links:
+            if checked >= limit:
+                break
+            if not link.startswith("http"):
+                continue
+            dom = domain_of(link)
+            last = domain_last_time.get(dom)
+            if last:
+                since = time.time() - last
+                if since < PER_DOMAIN_INTERVAL:
+                    wait = PER_DOMAIN_INTERVAL - since + random.uniform(0.2,0.8)
+                    print(f"[i] waiting {wait:.1f}s before requesting {dom}")
+                    time.sleep(wait)
+            if not obeys_robots(session, link):
+                print(f"[-] skip {link} due to robots")
+                domain_last_time[dom] = time.time()
+                continue
+            print(f"[+] checking link: {link}")
+            res = fetch_page(link, session)
+            domain_last_time[dom] = time.time()
+            polite_sleep()
+            checked += 1
+            if res["status"] == "ok":
+                findings = scan_text_for_target(res["text"], username)
+                if findings:
+                    results["search_hits"].append({"url": link, "matches": findings})
+                save_snapshot(username, f"search_{checked}", res.get("url", link), res["text"])
+            else:
+                results["search_hits"].append({"url": link, "error": res.get("error")})
+    # optional: if username looks like an address for some chain, also try explorers
+    # we'll attempt explorer lookups across requested chains
+    # if chains provided, try search with common wallet patterns: username + "wallet" or username + "sol" etc.
+    return results
+
+# ----------------- ADDRESS MODE -----------------
+def address_recon(addr, chains, session):
+    results = {"web_search": [], "explorers": []}
+    domain_last_time = {}
+    # 1) Perform web-wide exact-address search
+    q = f'"{addr}"'
+    try:
+        links = ddg_search(q, session)
+    except Exception as e:
+        print(f"[!] ddg search error: {e}")
+        links = []
+    checked = 0
+    for link in links:
+        if checked >= 40:
+            break
+        if not link.startswith("http"):
+            continue
+        dom = domain_of(link)
+        last = domain_last_time.get(dom)
+        if last:
+            since = time.time() - last
+            if since < PER_DOMAIN_INTERVAL:
+                wait = PER_DOMAIN_INTERVAL - since + random.uniform(0.2,0.8)
+                print(f"[i] waiting {wait:.1f}s before requesting {dom}")
+                time.sleep(wait)
+        if not obeys_robots(session, link):
+            print(f"[-] skip {link} due to robots")
+            domain_last_time[dom] = time.time()
+            continue
+        print(f"[+] checking {link}")
+        res = fetch_page(link, session)
+        domain_last_time[dom] = time.time()
+        polite_sleep()
+        checked += 1
+        if res["status"] == "ok":
+            findings = scan_text_for_target(res["text"], addr)
+            if findings:
+                results["web_search"].append({"url": link, "matches": findings})
+            save_snapshot(addr, f"websearch_{checked}", res.get("url", link), res["text"])
+        else:
+            results["web_search"].append({"url": link, "error": res.get("error")})
+    # 2) Try specific explorers for the requested chains
+    explorer_results = try_explorers_for_address(addr, chains, session, domain_last_time)
+    results["explorers"].extend(explorer_results)
+    return results
+
+# ----------------- VALIDATION -----------------
+def detect_chain_by_addr(addr):
+    out = []
+    if BTC_RE.match(addr):
+        out.append("btc")
+    if ETH_RE.match(addr):
+        out.append("eth")
+    # Solana addresses vary; include sol as possible if not ETH
+    if SOL_RE.match(addr):
+        out.append("sol")
+    if XMR_RE.match(addr):
+        out.append("xmr")
+    return out
+
+# ----------------- MAIN -----------------
+def main():
+    parser = argparse.ArgumentParser(description="Crypto recon (username or address) across BTC/ETH/SOL/XMR (no paid APIs).")
+    parser.add_argument("--target", "-t", required=True, help="username or wallet address to investigate")
+    parser.add_argument("--type", "-y", required=True, choices=["username","address"], help="mode: username or address")
+    parser.add_argument("--chains", "-c", default="", help="comma list of chains to target (btc,eth,sol,xmr) - optional for username, recommended for address")
+    parser.add_argument("--limit", type=int, default=50, help="max search results to check (approx)")
+    args = parser.parse_args()
+
+    target = args.target.strip()
+    chains = [c.strip().lower() for c in args.chains.split(",") if c.strip()]
+    if args.type == "address":
+        # if no chain specified, attempt detection heuristics
+        if not chains:
+            guessed = detect_chain_by_addr(target)
+            chains = guessed if guessed else ["btc","eth","sol","xmr"]
+            print(f"[i] guessed chains: {chains}")
+    else:
+        if not chains:
+            chains = ["btc","eth","sol","xmr"]
+
+    session = requests.Session()
+    report = {"target": target, "type": args.type, "chains": chains, "timestamp": time.time(), "results": {}}
+
+    if args.type == "username":
+        print(f"[+] running username recon for {target}")
+        report["results"] = username_recon(target, chains, session, limit=args.limit)
+    else:
+        print(f"[+] running address recon for {target} on chains: {chains}")
+        report["results"] = address_recon(target, chains, session)
+
+    # Save report
+    safe_name = re.sub(r"[^A-Za-z0-9_\-\.]", "_", target)[:80]
+    out_file = f"findings_{safe_name}.json"
+    with open(out_file, "w") as fh:
+        json.dump(report, fh, indent=2)
+    print(f"[+] report saved to {out_file}")
+    print("[+] snapshots (if any) saved under reports/{target}/")
+
+if __name__ == "__main__":
+    main()
